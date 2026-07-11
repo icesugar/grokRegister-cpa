@@ -213,6 +213,41 @@ def cloudflare_apply_auth_params(params=None):
     return merged
 
 
+# ==================== freemail (idinging/freemail) X-Admin-Token auth ====================
+_freemail_session = None
+_freemail_session_api_base = ""
+
+
+def _ensure_freemail_session(api_base, force=False):
+    """确保 freemail session 已初始化，所有请求通过 X-Admin-Token header 鉴权。
+
+    无需走登录接口，直接在请求头中携带 X-Admin-Token。
+    Session 会默认携带 X-Admin-Token，每个请求自动注入。
+    """
+    global _freemail_session, _freemail_session_api_base
+    token = get_cloudflare_api_key()
+    if not token:
+        raise Exception("freemail Admin Token 未配置")
+    if force or _freemail_session is None or _freemail_session_api_base != api_base:
+        _freemail_session = requests.Session()
+        _freemail_session_api_base = api_base
+        # 所有通过此 session 发出的请求自动携带 X-Admin-Token
+        _freemail_session.headers.update({"X-Admin-Token": token})
+    return _freemail_session
+
+
+def _reset_freemail_session():
+    """重置 freemail session。"""
+    global _freemail_session, _freemail_session_api_base
+    _freemail_session = None
+    _freemail_session_api_base = ""
+
+
+def _is_freemail_session_active():
+    """检查 freemail session 是否已创建。"""
+    return _freemail_session is not None
+
+
 def cloudflare_next_default_domain():
     """按配置轮换选择 Cloudflare 临时邮箱域名。"""
     global _cf_domain_index
@@ -249,32 +284,29 @@ def _pick_list_payload(data):
 
 
 def cloudflare_create_temp_address(api_base):
-    """适配 cloudflare_temp_email 新建地址接口并兼容 admin 创建模式。"""
-    path = get_cloudflare_path("cloudflare_path_accounts", "/api/new_address")
-    url = f"{api_base}{path}"
+    """freemail: 使用 GET /api/generate 生成随机临时邮箱。"""
+    session = _ensure_freemail_session(api_base)
     domain = cloudflare_next_default_domain()
-    is_admin_create = cloudflare_is_admin_create_path(path)
-    if is_admin_create:
-        payload = {"name": generate_username(10), "enablePrefix": True}
-        if domain:
-            payload["domain"] = domain
-        headers = cloudflare_build_headers(content_type=True)
-    else:
-        payload = {}
-        if domain:
-            payload["domain"] = domain
-        headers = cloudflare_apply_custom_auth({"Content-Type": "application/json"})
-    resp = http_post(url, json=payload, headers=headers)
+    params = {"length": 10}
+    if domain:
+        try:
+            domains = cloudflare_get_domains(api_base)
+            for idx, d in enumerate(domains):
+                if d == domain:
+                    params["domainIndex"] = idx
+                    break
+        except Exception:
+            pass
+    resp = session.get(f"{api_base}/api/generate", params=params, timeout=15)
     resp.raise_for_status()
     try:
         data = resp.json()
     except Exception:
-        raise Exception(f"Cloudflare {path} 返回非JSON: {resp.text[:300]}")
-    address = data.get("address")
-    jwt = data.get("jwt")
-    if not address or not jwt:
-        raise Exception(f"Cloudflare {path} 缺少 address/jwt: {data}")
-    return address, jwt
+        raise Exception(f"freemail /api/generate 返回非JSON: {resp.text[:300]}")
+    address = data.get("email")
+    if not address:
+        raise Exception(f"freemail /api/generate 缺少 email 字段: {data}")
+    return address, ""
 
 
 def get_user_agent():
@@ -450,92 +482,77 @@ def get_message_detail(token, message_id):
 
 
 def cloudflare_get_domains(api_base, api_key=None):
-    headers = cloudflare_build_headers(content_type=False)
-    if api_key and "Authorization" in headers:
-        headers["Authorization"] = f"Bearer {api_key}"
-    if api_key and "X-API-Key" in headers:
-        headers["X-API-Key"] = api_key
-    path = get_cloudflare_path("cloudflare_path_domains", "/domains")
-    params = cloudflare_apply_auth_params()
-    resp = http_get(f"{api_base}{path}", headers=headers, params=params)
+    """freemail: 获取可用域名列表。"""
+    session = _ensure_freemail_session(api_base)
+    resp = session.get(f"{api_base}/api/domains", timeout=15)
     resp.raise_for_status()
-    return _pick_list_payload(resp.json())
+    data = resp.json()
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return _pick_list_payload(data)
+    return []
 
 
 def cloudflare_create_account(api_base, address, password, api_key=None, expires_in=0):
-    headers = cloudflare_build_headers(content_type=True)
-    if api_key and "Authorization" in headers:
-        headers["Authorization"] = f"Bearer {api_key}"
-    if api_key and "X-API-Key" in headers:
-        headers["X-API-Key"] = api_key
-    payload = {"address": address, "password": password, "expiresIn": expires_in}
-    path = get_cloudflare_path("cloudflare_path_accounts", "/accounts")
-    params = cloudflare_apply_auth_params()
-    resp = http_post(f"{api_base}{path}", json=payload, headers=headers, params=params)
-    resp.raise_for_status()
-    return resp.json()
+    """freemail 不使用此接口（无密码概念），保留供兜底兼容。"""
+    raise Exception("freemail 不支持 cloudflare_temp_email 的 create_account 接口")
 
 
 def cloudflare_get_token(api_base, address, password, api_key=None):
-    headers = cloudflare_build_headers(content_type=True)
-    if api_key and "Authorization" in headers:
-        headers["Authorization"] = f"Bearer {api_key}"
-    if api_key and "X-API-Key" in headers:
-        headers["X-API-Key"] = api_key
-    path = get_cloudflare_path("cloudflare_path_token", "/token")
-    resp = http_post(
-        f"{api_base}{path}",
-        json={"address": address, "password": password},
-        headers=headers,
-        params=cloudflare_apply_auth_params(),
+    """freemail 不使用 JWT token，返回空字符串。"""
+    return ""
+
+
+def cloudflare_get_messages(api_base, token_or_email, email=None):
+    """freemail: 拉取邮箱邮件列表。
+
+    参数兼容两种调用方式：
+    - cloudflare_get_messages(api_base, token)   — 旧接口，token 被忽略
+    - cloudflare_get_messages(api_base, email)   — 直接用邮箱地址查询
+    """
+    session = _ensure_freemail_session(api_base)
+    mailbox = email or token_or_email or ""
+    if not mailbox:
+        raise Exception("freemail 拉取邮件需要邮箱地址")
+    resp = session.get(
+        f"{api_base}/api/emails",
+        params={"mailbox": mailbox, "limit": 50},
+        timeout=15,
     )
     resp.raise_for_status()
     data = resp.json()
+    if isinstance(data, list):
+        return data
     if isinstance(data, dict):
-        if data.get("token"):
-            return data.get("token")
-        if isinstance(data.get("data"), dict) and data["data"].get("token"):
-            return data["data"].get("token")
-    return None
-
-
-def cloudflare_get_messages(api_base, token):
-    headers = cloudflare_apply_custom_auth({"Authorization": f"Bearer {token}"})
-    path = get_cloudflare_path("cloudflare_path_messages", "/messages")
-    params = {"limit": 20, "offset": 0}
-    params = cloudflare_apply_auth_params(params)
-    resp = http_get(f"{api_base}{path}", headers=headers, params=params)
-    resp.raise_for_status()
-    try:
-        data = resp.json()
-    except Exception:
-        raise Exception(f"Cloudflare messages 返回非JSON: {resp.text[:300]}")
-    return _pick_list_payload(data)
+        return _pick_list_payload(data)
+    return []
 
 
 def cloudflare_get_message_detail(api_base, token, message_id):
-    headers = cloudflare_apply_custom_auth({"Authorization": f"Bearer {token}"})
+    """freemail: 获取单封邮件详情。
+
+    兼容旧接口签名，token 参数被忽略（使用 session 携带的 X-Admin-Token）。
+    """
+    session = _ensure_freemail_session(api_base)
     candidates = [
-        f"{api_base}/api/mail/{message_id}",
-        f"{api_base}{get_cloudflare_path('cloudflare_path_messages', '/messages')}/{message_id}",
+        f"{api_base}/api/email/{message_id}",
+        f"{api_base}/api/emails/{message_id}",
     ]
     last_err = None
     for url in candidates:
         try:
-            resp = http_get(
-                url,
-                headers=headers,
-                params=cloudflare_apply_auth_params(),
-            )
-            resp.raise_for_status()
+            resp = session.get(url, timeout=15)
+            if resp.status_code >= 400:
+                last_err = Exception(f"HTTP {resp.status_code}: {resp.text[:200]}")
+                continue
             data = resp.json()
-            if isinstance(data, dict) and isinstance(data.get("data"), dict):
-                return data["data"]
-            return data
+            if isinstance(data, dict):
+                return data
         except Exception as exc:
             last_err = exc
             continue
-    raise Exception(f"Cloudflare 获取邮件详情失败: {last_err}")
+    raise Exception(f"freemail 获取邮件详情失败: {last_err}")
 
 
 YYDS_API_BASE = "https://maliapi.215.im/v1"
@@ -766,30 +783,8 @@ def get_email_and_token(api_key=None):
         api_base = get_cloudflare_api_base()
         if not api_base:
             raise Exception("Cloudflare API Base 未配置")
-        try:
-            # cloudflare_temp_email 专用模式
-            return cloudflare_create_temp_address(api_base)
-        except Exception as primary_exc:
-            # 兜底回退到 Mail.tm 风格
-            key = api_key or get_cloudflare_api_key()
-            domains = cloudflare_get_domains(api_base, api_key=key)
-            if not domains:
-                raise Exception(f"Cloudflare 创建邮箱失败: {primary_exc}")
-            verified = [d for d in domains if d.get("isVerified")]
-            target = verified[0] if verified else domains[0]
-            domain = target.get("domain")
-            if not domain:
-                raise Exception("Cloudflare 域名数据格式错误，缺少 domain 字段")
-            username = generate_username(10)
-            address = f"{username}@{domain}"
-            password = secrets.token_urlsafe(12)
-            cloudflare_create_account(
-                api_base, address, password, api_key=key, expires_in=0
-            )
-            token = cloudflare_get_token(api_base, address, password, api_key=key)
-            if not token:
-                raise Exception("获取 Cloudflare 邮箱 token 失败")
-            return address, token
+        # freemail 模式：直接使用 /api/generate 创建邮箱
+        return cloudflare_create_temp_address(api_base)
     key = api_key or get_duckmail_api_key()
     domain = pick_domain(api_key=key)
     username = generate_username(10)
@@ -943,7 +938,7 @@ def cloudflare_get_oai_code(
                     log_callback(f"[Debug] 触发重发验证码失败: {exc}")
             next_resend_at = time.time() + 35
         try:
-            messages = cloudflare_get_messages(api_base, dev_token)
+            messages = cloudflare_get_messages(api_base, email)
         except Exception as exc:
             if log_callback:
                 log_callback(f"[Debug] Cloudflare 拉取邮件列表失败: {exc}")
@@ -960,38 +955,45 @@ def cloudflare_get_oai_code(
             if attempt >= 5:
                 continue
             seen_attempts[msg_id] = attempt + 1
-            recipients = [t.get("address", "").lower() for t in (msg.get("to") or [])]
-            msg_addr = str(msg.get("address", "")).lower()
-            # 优先匹配目标邮箱；若结构不一致也允许继续解析，避免接口字段漂移导致漏码
+            # freemail 通过 mailbox 参数已过滤目标邮箱，无需再匹配 to/address
             address_matched = True
-            if recipients:
-                address_matched = email.lower() in recipients
-            elif msg_addr:
-                address_matched = msg_addr == email.lower()
             if not address_matched and log_callback:
-                log_callback(f"[Debug] 跳过疑似非目标邮件 id={msg_id} address={msg_addr} to={recipients}")
                 continue
             parts = []
-            # 先直接从列表项取内容，避免 detail 接口差异导致漏码
-            for field in ("text", "raw", "content", "intro", "body", "snippet"):
+            # freemail 列表项字段：preview, verification_code
+            for field in ("preview", "text", "raw", "content", "intro", "body", "snippet", "verification_code"):
                 value = msg.get(field)
                 if isinstance(value, str) and value.strip():
                     parts.append(value)
-            html_list = msg.get("html") or []
+            # freemail 列表项可能直接包含 verification_code，长度不足 6 位则视为无效，走后续正则兜底
+            vc = msg.get("verification_code")
+            if isinstance(vc, str) and len(vc.strip()) >= 6:
+                code = vc.strip()
+                if log_callback:
+                    log_callback(f"[*] Cloudflare 从邮件列表中直接提取验证码: {code}")
+                return code
+            html_list = msg.get("html") or msg.get("html_content") or []
             if isinstance(html_list, str):
                 html_list = [html_list]
             for h in html_list:
                 parts.append(re.sub(r"<[^>]+>", " ", h))
             subject = str(msg.get("subject", "") or "")
             combined = "\n".join(parts)
-            # 再尝试 detail 接口补全内容
+            # freemail detail 接口字段：content, html_content, verification_code
             try:
                 detail = cloudflare_get_message_detail(api_base, dev_token, msg_id)
-                for field in ("text", "raw", "content", "intro", "body", "snippet"):
+                for field in ("preview", "text", "raw", "content", "intro", "body", "snippet", "verification_code"):
                     value = detail.get(field)
                     if isinstance(value, str) and value.strip():
                         combined += "\n" + value
-                html_list2 = detail.get("html") or []
+                # 直接检查 detail 中的 verification_code
+                detail_vc = detail.get("verification_code")
+                if isinstance(detail_vc, str) and len(detail_vc.strip()) >= 6:
+                    code = detail_vc.strip()
+                    if log_callback:
+                        log_callback(f"[*] Cloudflare 从邮件详情中直接提取验证码: {code}")
+                    return code
+                html_list2 = detail.get("html") or detail.get("html_content") or []
                 if isinstance(html_list2, str):
                     html_list2 = [html_list2]
                 for h in html_list2:
@@ -1631,7 +1633,7 @@ def _wait_email_page_advanced(email, wait=4.0, cancel_callback=None):
 def fill_email_and_submit(timeout=45, log_callback=None, cancel_callback=None):
     raise_if_cancelled(cancel_callback)
     email, dev_token = get_email_and_token()
-    if not email or not dev_token:
+    if not email:
         raise Exception("获取邮箱失败")
     if log_callback:
         log_callback(f"[*] 已创建邮箱: {email}")
