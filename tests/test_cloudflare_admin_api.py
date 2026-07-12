@@ -22,6 +22,8 @@ class CloudflareAdminCreateTests(unittest.TestCase):
         self.original_config = app.config.copy()
         self.original_cf_domain_index = app._cf_domain_index
         app._cf_domain_index = 0
+        # 单测默认走 cloudflare_temp_email，避免被本地 config.json 的 freemail 污染
+        app.config = app.DEFAULT_CONFIG.copy()
 
     def tearDown(self):
         app.config = self.original_config
@@ -47,6 +49,7 @@ class CloudflareAdminCreateTests(unittest.TestCase):
 
     def test_app_uses_admin_new_address_with_x_admin_auth(self):
         app.config.update({
+            "cloudflare_backend": "temp_email",
             "cloudflare_api_key": "admin-secret",
             "cloudflare_auth_mode": "x-admin-auth",
             "cloudflare_path_accounts": "/admin/new_address",
@@ -76,6 +79,7 @@ class CloudflareAdminCreateTests(unittest.TestCase):
 
     def test_app_keeps_anonymous_new_address_with_none_auth(self):
         app.config.update({
+            "cloudflare_backend": "temp_email",
             "cloudflare_api_key": "",
             "cloudflare_auth_mode": "none",
             "cloudflare_custom_auth": "",
@@ -100,6 +104,7 @@ class CloudflareAdminCreateTests(unittest.TestCase):
 
     def test_app_injects_custom_auth_on_anonymous_new_address(self):
         app.config.update({
+            "cloudflare_backend": "temp_email",
             "cloudflare_api_key": "",
             "cloudflare_auth_mode": "none",
             "cloudflare_custom_auth": "global-pass",
@@ -120,6 +125,32 @@ class CloudflareAdminCreateTests(unittest.TestCase):
             "Content-Type": "application/json",
             "x-custom-auth": "global-pass",
         })
+
+    def test_freemail_generate_uses_admin_token_header(self):
+        app.config.update({
+            "cloudflare_backend": "freemail",
+            "cloudflare_api_key": "fm-admin-token",
+            "defaultDomains": "edu.example.com",
+        })
+        captured = {}
+
+        class FakeSession:
+            def __init__(self):
+                self.headers = {"X-Admin-Token": "fm-admin-token"}
+
+            def get(self, url, params=None, timeout=15):
+                captured["url"] = url
+                captured["params"] = params
+                captured["headers"] = dict(self.headers)
+                return DummyResponse({"email": "abc@edu.example.com"})
+
+        with patch.object(app, "_ensure_freemail_session", return_value=FakeSession()):
+            address, jwt = app.cloudflare_create_temp_address("https://freemail.example.com")
+
+        self.assertEqual(address, "abc@edu.example.com")
+        self.assertEqual(jwt, "")
+        self.assertEqual(captured["url"], "https://freemail.example.com/api/generate")
+        self.assertEqual(captured["headers"]["X-Admin-Token"], "fm-admin-token")
 
     def test_debug_tool_can_create_address_through_admin_api(self):
         captured = {}

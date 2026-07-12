@@ -64,20 +64,23 @@ cp config.example.json config.json
 | `cpa_management_key` | 远程 CPA 管理密钥（`remote-management.secret-key` 明文） |
 | `email_provider` | `duckmail` / `yyds` / `cloudflare` |
 | `register_count` | 目标注册数量 |
-| `proxy` | 代理；device-flow 换 token 也走此代理 |
+| `proxy` | 单代理；未配置代理池时使用；device-flow 换 token 也走此代理 |
+| `proxy_pool_file` | 代理池 txt 路径（一行一个代理）；启用后一代理一账号，注册完自动切换 |
 | `enable_nsfw` | 注册后是否尝试开启 NSFW |
 | `cloudflare_api_base` | Cloudflare 临时邮箱 API 根地址 |
-| `cloudflare_api_key` | 默认匿名模式留空；admin 模式填 `ADMIN_PASSWORD` |
-| `cloudflare_auth_mode` | `none` / `bearer` / `x-api-key` / `x-admin-auth` / `query-key` |
+| `cloudflare_api_key` | 默认匿名模式留空；admin / freemail 模式填密钥 |
+| `cloudflare_auth_mode` | `none` / `bearer` / `x-api-key` / `x-admin-auth` / `query-key`（仅 temp_email） |
+| `cloudflare_backend` | `temp_email`（cloudflare_temp_email，默认）/ `freemail`（idinging/freemail） |
 | `cloudflare_custom_auth` | Worker 全局密码（`PASSWORDS`），注入 `x-custom-auth` |
-| `cloudflare_path_*` | domains / accounts / token / messages 路径 |
+| `cloudflare_path_*` | domains / accounts / token / messages 路径（仅 temp_email） |
 | `defaultDomains` | Cloudflare 默认收信域名 |
 
-### Cloudflare 邮箱（默认匿名）
+### Cloudflare 邮箱（默认 cloudflare_temp_email 匿名）
 
 ```json
 {
   "email_provider": "cloudflare",
+  "cloudflare_backend": "temp_email",
   "cloudflare_api_base": "https://你的-worker-api-域名",
   "cloudflare_api_key": "",
   "cloudflare_auth_mode": "none",
@@ -93,11 +96,55 @@ cp config.example.json config.json
 
 ```json
 {
+  "cloudflare_backend": "temp_email",
   "cloudflare_api_key": "你的 ADMIN_PASSWORD",
   "cloudflare_auth_mode": "x-admin-auth",
   "cloudflare_path_accounts": "/admin/new_address"
 }
 ```
+
+### freemail（idinging/freemail）
+
+```json
+{
+  "email_provider": "cloudflare",
+  "cloudflare_backend": "freemail",
+  "cloudflare_api_base": "https://你的-freemail-worker-域名",
+  "cloudflare_api_key": "你的 X-Admin-Token",
+  "defaultDomains": "你的收信域名.com"
+}
+```
+
+`cloudflare_api_key` 填 freemail 的 Admin Token，请求头会注入 `X-Admin-Token`。  
+`cloudflare_auth_mode` / `cloudflare_path_*` 在 freemail 下会被忽略。
+
+### 代理池（一代理一账号）
+
+把代理写进 txt，一行一个；配置 `proxy_pool_file` 后，每个账号使用池中下一个代理（浏览器 + HTTP 请求 + CPA device-flow 共用）。
+
+```text
+# proxies.txt
+http://127.0.0.1:7890
+http://user:pass@1.2.3.4:8080
+socks5://5.6.7.8:1080
+9.9.9.9:3128
+```
+
+```json
+{
+  "proxy_pool_file": "proxies.txt",
+  "register_count": 10
+}
+```
+
+- 相对路径相对本脚本目录；也可用绝对路径
+- 忽略空行与 `#` 注释；无 `://` 时自动补 `http://`
+- **先探测连通**（访问 `accounts.x.ai` 等），不通则跳过该代理，换下一个
+- 可用代理耗尽或达到 `register_count` 时结束
+- 未配置 `proxy_pool_file` 时仍走原来的单代理 `proxy`（若配置了也会先探测）
+- 同一账号重试（验证码失败等）会复用当前代理，不会跳过
+
+可参考仓库内 `proxies.example.txt`。
 
 调试创建接口：
 

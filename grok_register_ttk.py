@@ -49,11 +49,15 @@ DEFAULT_CONFIG = {
     "cloudflare_api_key": "",
     "cloudflare_auth_mode": "none",
     "cloudflare_custom_auth": "",
+    # 临时邮箱后端：temp_email=cloudflare_temp_email；freemail=idinging/freemail
+    "cloudflare_backend": "temp_email",
     "cloudflare_path_domains": "/api/domains",
     "cloudflare_path_accounts": "/api/new_address",
     "cloudflare_path_token": "/api/token",
     "cloudflare_path_messages": "/api/mails",
     "proxy": "http://127.0.0.1:7890",
+    # 代理池 txt：一行一个代理；启用后一代理一账号，用完切换下一个
+    "proxy_pool_file": "",
     "enable_nsfw": True,
     "register_count": 1,
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
@@ -142,11 +146,186 @@ EXTENSION_PATH = os.path.abspath(
 DUCKMAIL_API_BASE = "https://api.duckmail.sbs"
 
 
+# 当前账号生效的代理（代理池轮换时写入）；None 表示回退到 config.proxy
+_current_proxy = None
+
+
+def normalize_proxy_url(raw):
+    """规范化代理地址，支持 host:port / http(s):// / socks5://。"""
+    s = str(raw or "").strip()
+    if not s or s.startswith("#"):
+        return ""
+    if "://" not in s:
+        s = "http://" + s
+    return s
+
+
+def load_proxy_pool(path):
+    """从 txt 加载代理池，一行一个，忽略空行与 # 注释。"""
+    path = str(path or "").strip()
+    if not path:
+        return []
+    if not os.path.isabs(path):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"代理池文件不存在: {path}")
+    proxies = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            proxy = normalize_proxy_url(line)
+            if proxy:
+                proxies.append(proxy)
+    return proxies
+
+
+def set_current_proxy(proxy):
+    """设置当前账号使用的代理；传 None 表示回退到 config.proxy。"""
+    global _current_proxy
+    if proxy is None:
+        _current_proxy = None
+    else:
+        _current_proxy = normalize_proxy_url(proxy)
+
+
+def get_active_proxy():
+    """当前生效代理：优先代理池写入的 _current_proxy，否则 config.proxy。"""
+    if _current_proxy is not None:
+        return _current_proxy
+    return normalize_proxy_url(config.get("proxy", ""))
+
+
 def get_proxies():
-    proxy = config.get("proxy", "")
+    proxy = get_active_proxy()
     if proxy:
         return {"http": proxy, "https": proxy}
     return {}
+
+
+def apply_proxy_for_index(index, proxy_pool, log_callback=None):
+    """按序号应用代理池中的代理（不做连通测试）。
+
+    返回 True 表示可继续；代理池已用尽时返回 False。
+    无代理池时回退到 config.proxy。
+    """
+    if proxy_pool:
+        if index >= len(proxy_pool):
+            if log_callback:
+                log_callback(f"[!] 代理池已用尽（共 {len(proxy_pool)} 个），停止注册")
+            return False
+        proxy = proxy_pool[index]
+        set_current_proxy(proxy)
+        if log_callback:
+            log_callback(f"[*] 使用代理 [{index + 1}/{len(proxy_pool)}]: {proxy}")
+        return True
+    set_current_proxy(None)
+    proxy = get_active_proxy()
+    if proxy and log_callback:
+        log_callback(f"[*] 使用代理: {proxy}")
+    return True
+
+
+# 代理连通探测 URL（任一成功即视为可用；不走 http_get 的直连回退）
+PROXY_PROBE_URLS = (
+    "https://accounts.x.ai/",
+    "https://cloudflare.com/cdn-cgi/trace",
+)
+
+
+def test_proxy_connectivity(proxy="", timeout=10, log_callback=None):
+    """探测代理是否可出网。
+
+    必须用原始 requests，禁止走 http_get 的「代理失败改直连」回退，
+    否则坏代理也会被误判为可用。
+    返回 (ok, message)。
+    """
+    proxy = normalize_proxy_url(proxy)
+    proxies = {"http": proxy, "https": proxy} if proxy else {}
+    label = proxy or "直连"
+    last_err = "无响应"
+    for url in PROXY_PROBE_URLS:
+        try:
+            if log_callback:
+                log_callback(f"[*] 探测代理: {label} -> {url}")
+            resp = requests.get(
+                url,
+                proxies=proxies,
+                timeout=timeout,
+                impersonate="chrome120",
+                allow_redirects=True,
+            )
+            # 2xx/3xx/4xx 均说明链路通（站点本身拒绝也算代理可用）
+            if resp.status_code < 500:
+                msg = f"HTTP {resp.status_code}"
+                if log_callback:
+                    log_callback(f"[+] 代理可用: {label} ({msg})")
+                return True, msg
+            last_err = f"HTTP {resp.status_code}"
+        except Exception as exc:
+            last_err = str(exc)
+            continue
+    if log_callback:
+        log_callback(f"[-] 代理不可用: {label} | {last_err}")
+    return False, last_err
+
+
+def acquire_proxy_for_slot(
+    proxy_pool,
+    cursor=0,
+    log_callback=None,
+    cancel_callback=None,
+    do_test=True,
+    timeout=10,
+):
+    """从 cursor 起挑选可用代理并 set_current_proxy。
+
+    代理池模式：逐个探测，失败则跳过，直到找到可用或用尽。
+    无池时：使用 config.proxy；若配置了代理且探测失败则中止。
+
+    返回 (ok, next_cursor)：
+    - ok=True：已应用代理，next_cursor 为「当前占用代理」的下一位（供下一账号使用）
+    - ok=False：无可用代理
+    """
+    if proxy_pool:
+        idx = max(int(cursor or 0), 0)
+        while idx < len(proxy_pool):
+            raise_if_cancelled(cancel_callback)
+            proxy = proxy_pool[idx]
+            set_current_proxy(proxy)
+            if log_callback:
+                log_callback(f"[*] 候选代理 [{idx + 1}/{len(proxy_pool)}]: {proxy}")
+            if not do_test:
+                return True, idx + 1
+            ok, msg = test_proxy_connectivity(
+                proxy, timeout=timeout, log_callback=log_callback
+            )
+            if ok:
+                return True, idx + 1
+            if log_callback:
+                log_callback(f"[!] 跳过不可用代理 [{idx + 1}/{len(proxy_pool)}]: {proxy}")
+            idx += 1
+        if log_callback:
+            log_callback(
+                f"[!] 代理池无可用代理（从第 {max(int(cursor or 0), 0) + 1} 个起均失败或已用尽）"
+            )
+        return False, idx
+
+    # 单代理 / 直连
+    set_current_proxy(None)
+    proxy = get_active_proxy()
+    if proxy:
+        if log_callback:
+            log_callback(f"[*] 使用单代理: {proxy}")
+        if do_test:
+            ok, msg = test_proxy_connectivity(
+                proxy, timeout=timeout, log_callback=log_callback
+            )
+            if not ok:
+                if log_callback:
+                    log_callback(f"[!] 单代理不可用，中止注册: {msg}")
+                return False, cursor
+    elif log_callback:
+        log_callback("[*] 未配置代理，将直连")
+    return True, cursor
 
 
 def get_duckmail_api_key():
@@ -213,6 +392,18 @@ def cloudflare_apply_auth_params(params=None):
     return merged
 
 
+def get_cloudflare_backend():
+    """临时邮箱后端：temp_email（cloudflare_temp_email）/ freemail（idinging/freemail）。"""
+    raw = str(config.get("cloudflare_backend", "temp_email") or "temp_email").strip().lower()
+    if raw in ("freemail", "free-mail", "free_mail"):
+        return "freemail"
+    return "temp_email"
+
+
+def is_freemail_backend():
+    return get_cloudflare_backend() == "freemail"
+
+
 # ==================== freemail (idinging/freemail) X-Admin-Token auth ====================
 _freemail_session = None
 _freemail_session_api_base = ""
@@ -227,7 +418,7 @@ def _ensure_freemail_session(api_base, force=False):
     global _freemail_session, _freemail_session_api_base
     token = get_cloudflare_api_key()
     if not token:
-        raise Exception("freemail Admin Token 未配置")
+        raise Exception("freemail Admin Token 未配置（请填写 cloudflare_api_key）")
     if force or _freemail_session is None or _freemail_session_api_base != api_base:
         _freemail_session = requests.Session()
         _freemail_session_api_base = api_base
@@ -283,16 +474,18 @@ def _pick_list_payload(data):
     return []
 
 
-def cloudflare_create_temp_address(api_base):
+def freemail_create_temp_address(api_base):
     """freemail: 使用 GET /api/generate 生成随机临时邮箱。"""
     session = _ensure_freemail_session(api_base)
     domain = cloudflare_next_default_domain()
     params = {"length": 10}
     if domain:
         try:
-            domains = cloudflare_get_domains(api_base)
+            domains = freemail_get_domains(api_base)
             for idx, d in enumerate(domains):
-                if d == domain:
+                # freemail 可能返回字符串或对象
+                name = d if isinstance(d, str) else str((d or {}).get("domain") or (d or {}).get("name") or "")
+                if name == domain:
                     params["domainIndex"] = idx
                     break
         except Exception:
@@ -306,7 +499,98 @@ def cloudflare_create_temp_address(api_base):
     address = data.get("email")
     if not address:
         raise Exception(f"freemail /api/generate 缺少 email 字段: {data}")
+    # freemail 无 JWT，返回空 token；拉邮件时用邮箱地址
     return address, ""
+
+
+def freemail_get_domains(api_base, api_key=None):
+    """freemail: 获取可用域名列表。"""
+    session = _ensure_freemail_session(api_base)
+    resp = session.get(f"{api_base}/api/domains", timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return _pick_list_payload(data)
+    return []
+
+
+def freemail_get_messages(api_base, email):
+    """freemail: 按 mailbox 拉取邮件列表。"""
+    session = _ensure_freemail_session(api_base)
+    mailbox = str(email or "").strip()
+    if not mailbox:
+        raise Exception("freemail 拉取邮件需要邮箱地址")
+    resp = session.get(
+        f"{api_base}/api/emails",
+        params={"mailbox": mailbox, "limit": 50},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return _pick_list_payload(data)
+    return []
+
+
+def freemail_get_message_detail(api_base, message_id):
+    """freemail: 获取单封邮件详情。"""
+    session = _ensure_freemail_session(api_base)
+    candidates = [
+        f"{api_base}/api/email/{message_id}",
+        f"{api_base}/api/emails/{message_id}",
+    ]
+    last_err = None
+    for url in candidates:
+        try:
+            resp = session.get(url, timeout=15)
+            if resp.status_code >= 400:
+                last_err = Exception(f"HTTP {resp.status_code}: {resp.text[:200]}")
+                continue
+            data = resp.json()
+            if isinstance(data, dict):
+                return data
+        except Exception as exc:
+            last_err = exc
+            continue
+    raise Exception(f"freemail 获取邮件详情失败: {last_err}")
+
+
+def cloudflare_create_temp_address(api_base):
+    """适配 cloudflare_temp_email 新建地址接口并兼容 admin 创建模式。
+
+    freemail 后端走独立路径，由 get_email_and_token 分流。
+    """
+    if is_freemail_backend():
+        return freemail_create_temp_address(api_base)
+    path = get_cloudflare_path("cloudflare_path_accounts", "/api/new_address")
+    url = f"{api_base}{path}"
+    domain = cloudflare_next_default_domain()
+    is_admin_create = cloudflare_is_admin_create_path(path)
+    if is_admin_create:
+        payload = {"name": generate_username(10), "enablePrefix": True}
+        if domain:
+            payload["domain"] = domain
+        headers = cloudflare_build_headers(content_type=True)
+    else:
+        payload = {}
+        if domain:
+            payload["domain"] = domain
+        headers = cloudflare_apply_custom_auth({"Content-Type": "application/json"})
+    resp = http_post(url, json=payload, headers=headers)
+    resp.raise_for_status()
+    try:
+        data = resp.json()
+    except Exception:
+        raise Exception(f"Cloudflare {path} 返回非JSON: {resp.text[:300]}")
+    address = data.get("address")
+    jwt = data.get("jwt")
+    if not address or not jwt:
+        raise Exception(f"Cloudflare {path} 缺少 address/jwt: {data}")
+    return address, jwt
 
 
 def get_user_agent():
@@ -350,7 +634,8 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None):
     sso = _normalize_sso_token(raw_token)
     if not sso:
         return
-    proxy = str(config.get("proxy", "") or "").strip()
+    # 与当前注册账号共用同一代理（代理池轮换时为当前账号的代理）
+    proxy = get_active_proxy()
 
     def _cpa_log(message):
         if log_callback:
@@ -385,6 +670,10 @@ def create_browser_options():
     options.set_timeouts(base=1)
     if os.path.exists(EXTENSION_PATH):
         options.add_extension(EXTENSION_PATH)
+    # 浏览器走当前生效代理（单代理或代理池）
+    proxy = get_active_proxy()
+    if proxy:
+        options.set_proxy(proxy)
     return options
 
 
@@ -482,77 +771,107 @@ def get_message_detail(token, message_id):
 
 
 def cloudflare_get_domains(api_base, api_key=None):
-    """freemail: 获取可用域名列表。"""
-    session = _ensure_freemail_session(api_base)
-    resp = session.get(f"{api_base}/api/domains", timeout=15)
+    if is_freemail_backend():
+        return freemail_get_domains(api_base, api_key=api_key)
+    headers = cloudflare_build_headers(content_type=False)
+    if api_key and "Authorization" in headers:
+        headers["Authorization"] = f"Bearer {api_key}"
+    if api_key and "X-API-Key" in headers:
+        headers["X-API-Key"] = api_key
+    path = get_cloudflare_path("cloudflare_path_domains", "/domains")
+    params = cloudflare_apply_auth_params()
+    resp = http_get(f"{api_base}{path}", headers=headers, params=params)
     resp.raise_for_status()
-    data = resp.json()
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        return _pick_list_payload(data)
-    return []
+    return _pick_list_payload(resp.json())
 
 
 def cloudflare_create_account(api_base, address, password, api_key=None, expires_in=0):
-    """freemail 不使用此接口（无密码概念），保留供兜底兼容。"""
-    raise Exception("freemail 不支持 cloudflare_temp_email 的 create_account 接口")
+    if is_freemail_backend():
+        raise Exception("freemail 不支持 cloudflare_temp_email 的 create_account 接口")
+    headers = cloudflare_build_headers(content_type=True)
+    if api_key and "Authorization" in headers:
+        headers["Authorization"] = f"Bearer {api_key}"
+    if api_key and "X-API-Key" in headers:
+        headers["X-API-Key"] = api_key
+    payload = {"address": address, "password": password, "expiresIn": expires_in}
+    path = get_cloudflare_path("cloudflare_path_accounts", "/accounts")
+    params = cloudflare_apply_auth_params()
+    resp = http_post(f"{api_base}{path}", json=payload, headers=headers, params=params)
+    resp.raise_for_status()
+    return resp.json()
 
 
 def cloudflare_get_token(api_base, address, password, api_key=None):
-    """freemail 不使用 JWT token，返回空字符串。"""
-    return ""
-
-
-def cloudflare_get_messages(api_base, token_or_email, email=None):
-    """freemail: 拉取邮箱邮件列表。
-
-    参数兼容两种调用方式：
-    - cloudflare_get_messages(api_base, token)   — 旧接口，token 被忽略
-    - cloudflare_get_messages(api_base, email)   — 直接用邮箱地址查询
-    """
-    session = _ensure_freemail_session(api_base)
-    mailbox = email or token_or_email or ""
-    if not mailbox:
-        raise Exception("freemail 拉取邮件需要邮箱地址")
-    resp = session.get(
-        f"{api_base}/api/emails",
-        params={"mailbox": mailbox, "limit": 50},
-        timeout=15,
+    if is_freemail_backend():
+        return ""
+    headers = cloudflare_build_headers(content_type=True)
+    if api_key and "Authorization" in headers:
+        headers["Authorization"] = f"Bearer {api_key}"
+    if api_key and "X-API-Key" in headers:
+        headers["X-API-Key"] = api_key
+    path = get_cloudflare_path("cloudflare_path_token", "/token")
+    resp = http_post(
+        f"{api_base}{path}",
+        json={"address": address, "password": password},
+        headers=headers,
+        params=cloudflare_apply_auth_params(),
     )
     resp.raise_for_status()
     data = resp.json()
-    if isinstance(data, list):
-        return data
     if isinstance(data, dict):
-        return _pick_list_payload(data)
-    return []
+        if data.get("token"):
+            return data.get("token")
+        if isinstance(data.get("data"), dict) and data["data"].get("token"):
+            return data["data"].get("token")
+    return None
+
+
+def cloudflare_get_messages(api_base, token, email=None):
+    """拉取邮件列表。
+
+    - temp_email：用 JWT Bearer token
+    - freemail：用邮箱地址（email 优先，否则 token 参数被当作邮箱）
+    """
+    if is_freemail_backend():
+        return freemail_get_messages(api_base, email or token)
+    headers = cloudflare_apply_custom_auth({"Authorization": f"Bearer {token}"})
+    path = get_cloudflare_path("cloudflare_path_messages", "/messages")
+    params = {"limit": 20, "offset": 0}
+    params = cloudflare_apply_auth_params(params)
+    resp = http_get(f"{api_base}{path}", headers=headers, params=params)
+    resp.raise_for_status()
+    try:
+        data = resp.json()
+    except Exception:
+        raise Exception(f"Cloudflare messages 返回非JSON: {resp.text[:300]}")
+    return _pick_list_payload(data)
 
 
 def cloudflare_get_message_detail(api_base, token, message_id):
-    """freemail: 获取单封邮件详情。
-
-    兼容旧接口签名，token 参数被忽略（使用 session 携带的 X-Admin-Token）。
-    """
-    session = _ensure_freemail_session(api_base)
+    if is_freemail_backend():
+        return freemail_get_message_detail(api_base, message_id)
+    headers = cloudflare_apply_custom_auth({"Authorization": f"Bearer {token}"})
     candidates = [
-        f"{api_base}/api/email/{message_id}",
-        f"{api_base}/api/emails/{message_id}",
+        f"{api_base}/api/mail/{message_id}",
+        f"{api_base}{get_cloudflare_path('cloudflare_path_messages', '/messages')}/{message_id}",
     ]
     last_err = None
     for url in candidates:
         try:
-            resp = session.get(url, timeout=15)
-            if resp.status_code >= 400:
-                last_err = Exception(f"HTTP {resp.status_code}: {resp.text[:200]}")
-                continue
+            resp = http_get(
+                url,
+                headers=headers,
+                params=cloudflare_apply_auth_params(),
+            )
+            resp.raise_for_status()
             data = resp.json()
-            if isinstance(data, dict):
-                return data
+            if isinstance(data, dict) and isinstance(data.get("data"), dict):
+                return data["data"]
+            return data
         except Exception as exc:
             last_err = exc
             continue
-    raise Exception(f"freemail 获取邮件详情失败: {last_err}")
+    raise Exception(f"Cloudflare 获取邮件详情失败: {last_err}")
 
 
 YYDS_API_BASE = "https://maliapi.215.im/v1"
@@ -783,8 +1102,33 @@ def get_email_and_token(api_key=None):
         api_base = get_cloudflare_api_base()
         if not api_base:
             raise Exception("Cloudflare API Base 未配置")
-        # freemail 模式：直接使用 /api/generate 创建邮箱
-        return cloudflare_create_temp_address(api_base)
+        if is_freemail_backend():
+            # freemail 模式：直接使用 /api/generate 创建邮箱
+            return freemail_create_temp_address(api_base)
+        try:
+            # cloudflare_temp_email 专用模式
+            return cloudflare_create_temp_address(api_base)
+        except Exception as primary_exc:
+            # 兜底回退到 Mail.tm 风格
+            key = api_key or get_cloudflare_api_key()
+            domains = cloudflare_get_domains(api_base, api_key=key)
+            if not domains:
+                raise Exception(f"Cloudflare 创建邮箱失败: {primary_exc}")
+            verified = [d for d in domains if d.get("isVerified")]
+            target = verified[0] if verified else domains[0]
+            domain = target.get("domain")
+            if not domain:
+                raise Exception("Cloudflare 域名数据格式错误，缺少 domain 字段")
+            username = generate_username(10)
+            address = f"{username}@{domain}"
+            password = secrets.token_urlsafe(12)
+            cloudflare_create_account(
+                api_base, address, password, api_key=key, expires_in=0
+            )
+            token = cloudflare_get_token(api_base, address, password, api_key=key)
+            if not token:
+                raise Exception("获取 Cloudflare 邮箱 token 失败")
+            return address, token
     key = api_key or get_duckmail_api_key()
     domain = pick_domain(api_key=key)
     username = generate_username(10)
@@ -922,6 +1266,7 @@ def cloudflare_get_oai_code(
     api_base = get_cloudflare_api_base()
     if not api_base:
         raise Exception("Cloudflare API Base 未配置")
+    freemail = is_freemail_backend()
     deadline = time.time() + timeout
     # 同一封邮件正文可能延迟可读，允许多次重试解析，避免偶发漏码
     seen_attempts = {}
@@ -938,7 +1283,8 @@ def cloudflare_get_oai_code(
                     log_callback(f"[Debug] 触发重发验证码失败: {exc}")
             next_resend_at = time.time() + 35
         try:
-            messages = cloudflare_get_messages(api_base, email)
+            # freemail 用邮箱地址查；temp_email 用 JWT
+            messages = cloudflare_get_messages(api_base, dev_token, email=email if freemail else None)
         except Exception as exc:
             if log_callback:
                 log_callback(f"[Debug] Cloudflare 拉取邮件列表失败: {exc}")
@@ -955,23 +1301,39 @@ def cloudflare_get_oai_code(
             if attempt >= 5:
                 continue
             seen_attempts[msg_id] = attempt + 1
-            # freemail 通过 mailbox 参数已过滤目标邮箱，无需再匹配 to/address
-            address_matched = True
-            if not address_matched and log_callback:
+            if freemail:
+                # freemail 通过 mailbox 参数已过滤目标邮箱
+                address_matched = True
+            else:
+                recipients = [t.get("address", "").lower() for t in (msg.get("to") or [])]
+                msg_addr = str(msg.get("address", "")).lower()
+                # 优先匹配目标邮箱；若结构不一致也允许继续解析，避免接口字段漂移导致漏码
+                address_matched = True
+                if recipients:
+                    address_matched = email.lower() in recipients
+                elif msg_addr:
+                    address_matched = msg_addr == email.lower()
+            if not address_matched:
+                if log_callback:
+                    log_callback(
+                        f"[Debug] 跳过疑似非目标邮件 id={msg_id}"
+                    )
                 continue
             parts = []
-            # freemail 列表项字段：preview, verification_code
-            for field in ("preview", "text", "raw", "content", "intro", "body", "snippet", "verification_code"):
+            # 列表字段：temp_email 与 freemail 兼容
+            list_fields = ("preview", "text", "raw", "content", "intro", "body", "snippet", "verification_code")
+            for field in list_fields:
                 value = msg.get(field)
                 if isinstance(value, str) and value.strip():
                     parts.append(value)
-            # freemail 列表项可能直接包含 verification_code，长度不足 6 位则视为无效，走后续正则兜底
-            vc = msg.get("verification_code")
-            if isinstance(vc, str) and len(vc.strip()) >= 6:
-                code = vc.strip()
-                if log_callback:
-                    log_callback(f"[*] Cloudflare 从邮件列表中直接提取验证码: {code}")
-                return code
+            # freemail 列表项可能直接包含 verification_code
+            if freemail:
+                vc = msg.get("verification_code")
+                if isinstance(vc, str) and len(vc.strip()) >= 6:
+                    code = vc.strip()
+                    if log_callback:
+                        log_callback(f"[*] Cloudflare 从邮件列表中直接提取验证码: {code}")
+                    return code
             html_list = msg.get("html") or msg.get("html_content") or []
             if isinstance(html_list, str):
                 html_list = [html_list]
@@ -979,20 +1341,20 @@ def cloudflare_get_oai_code(
                 parts.append(re.sub(r"<[^>]+>", " ", h))
             subject = str(msg.get("subject", "") or "")
             combined = "\n".join(parts)
-            # freemail detail 接口字段：content, html_content, verification_code
+            # detail 接口补全内容
             try:
                 detail = cloudflare_get_message_detail(api_base, dev_token, msg_id)
-                for field in ("preview", "text", "raw", "content", "intro", "body", "snippet", "verification_code"):
+                for field in list_fields:
                     value = detail.get(field)
                     if isinstance(value, str) and value.strip():
                         combined += "\n" + value
-                # 直接检查 detail 中的 verification_code
-                detail_vc = detail.get("verification_code")
-                if isinstance(detail_vc, str) and len(detail_vc.strip()) >= 6:
-                    code = detail_vc.strip()
-                    if log_callback:
-                        log_callback(f"[*] Cloudflare 从邮件详情中直接提取验证码: {code}")
-                    return code
+                if freemail:
+                    detail_vc = detail.get("verification_code")
+                    if isinstance(detail_vc, str) and len(detail_vc.strip()) >= 6:
+                        code = detail_vc.strip()
+                        if log_callback:
+                            log_callback(f"[*] Cloudflare 从邮件详情中直接提取验证码: {code}")
+                        return code
                 html_list2 = detail.get("html") or detail.get("html_content") or []
                 if isinstance(html_list2, str):
                     html_list2 = [html_list2]
@@ -1633,7 +1995,8 @@ def _wait_email_page_advanced(email, wait=4.0, cancel_callback=None):
 def fill_email_and_submit(timeout=45, log_callback=None, cancel_callback=None):
     raise_if_cancelled(cancel_callback)
     email, dev_token = get_email_and_token()
-    if not email:
+    # freemail 无 JWT，仅要求邮箱地址；temp_email / 其他服务商仍要求 token
+    if not email or (not is_freemail_backend() and not dev_token):
         raise Exception("获取邮箱失败")
     if log_callback:
         log_callback(f"[*] 已创建邮箱: {email}")
@@ -2614,27 +2977,29 @@ class GrokRegisterGUI:
         self.proxy_entry = tk_entry(config_frame, textvariable=self.proxy_var, width=34)
         add_field(self.proxy_entry, 1, 3)
 
-        add_label(2, 0, "DuckMail API Key:")
+        add_label(2, 0, "代理池文件:")
+        self.proxy_pool_file_var = tk.StringVar(value=config.get("proxy_pool_file", ""))
+        self.proxy_pool_file_entry = tk_entry(config_frame, textvariable=self.proxy_pool_file_var, width=72)
+        add_field(self.proxy_pool_file_entry, 2, 1, columnspan=3)
+
+        add_label(3, 0, "DuckMail API Key:")
         self.api_key_var = tk.StringVar(value=config.get("duckmail_api_key", ""))
         self.api_key_entry = tk_entry(config_frame, textvariable=self.api_key_var, width=34)
-        add_field(self.api_key_entry, 2, 1)
+        add_field(self.api_key_entry, 3, 1)
 
-        add_label(2, 2, "Cloudflare 鉴权模式:")
+        add_label(3, 2, "Cloudflare 鉴权模式:")
         self.cloudflare_auth_mode_var = tk.StringVar(value=config.get("cloudflare_auth_mode", "none"))
         self.cloudflare_auth_mode_combo = tk_option_menu(
             config_frame, self.cloudflare_auth_mode_var, ["query-key", "bearer", "x-api-key", "x-admin-auth", "none"], width=12
         )
-        add_field(self.cloudflare_auth_mode_combo, 2, 3, sticky=tk.W)
+        add_field(self.cloudflare_auth_mode_combo, 3, 3, sticky=tk.W)
 
-        add_label(3, 0, "Cloudflare API Base:")
-        self.cloudflare_api_base_var = tk.StringVar(value=config.get("cloudflare_api_base", ""))
-        self.cloudflare_api_base_entry = tk_entry(config_frame, textvariable=self.cloudflare_api_base_var, width=72)
-        add_field(self.cloudflare_api_base_entry, 3, 1, columnspan=3)
-
-        add_label(4, 0, "Cloudflare API Key:")
-        self.cloudflare_api_key_var = tk.StringVar(value=config.get("cloudflare_api_key", ""))
-        self.cloudflare_api_key_entry = tk_entry(config_frame, textvariable=self.cloudflare_api_key_var, width=34)
-        add_field(self.cloudflare_api_key_entry, 4, 1)
+        add_label(4, 0, "Cloudflare 后端:")
+        self.cloudflare_backend_var = tk.StringVar(value=config.get("cloudflare_backend", "temp_email"))
+        self.cloudflare_backend_combo = tk_option_menu(
+            config_frame, self.cloudflare_backend_var, ["temp_email", "freemail"], width=12
+        )
+        add_field(self.cloudflare_backend_combo, 4, 1, sticky=tk.W)
 
         add_label(4, 2, "CF 路径:")
         self.cloudflare_paths_var = tk.StringVar(
@@ -2650,25 +3015,35 @@ class GrokRegisterGUI:
         self.cloudflare_paths_entry = tk_entry(config_frame, textvariable=self.cloudflare_paths_var, width=34)
         add_field(self.cloudflare_paths_entry, 4, 3)
 
-        add_label(5, 0, "CPA 直出(SSO→auth):")
+        add_label(5, 0, "Cloudflare API Base:")
+        self.cloudflare_api_base_var = tk.StringVar(value=config.get("cloudflare_api_base", ""))
+        self.cloudflare_api_base_entry = tk_entry(config_frame, textvariable=self.cloudflare_api_base_var, width=72)
+        add_field(self.cloudflare_api_base_entry, 5, 1, columnspan=3)
+
+        add_label(6, 0, "Cloudflare API Key:")
+        self.cloudflare_api_key_var = tk.StringVar(value=config.get("cloudflare_api_key", ""))
+        self.cloudflare_api_key_entry = tk_entry(config_frame, textvariable=self.cloudflare_api_key_var, width=34)
+        add_field(self.cloudflare_api_key_entry, 6, 1)
+
+        add_label(7, 0, "CPA 直出(SSO→auth):")
         self.cpa_auto_add_var = tk.BooleanVar(value=bool(config.get("cpa_auto_add", False)))
         self.cpa_auto_add_check = tk_checkbutton(config_frame, variable=self.cpa_auto_add_var)
-        add_field(self.cpa_auto_add_check, 5, 1, sticky=tk.W)
+        add_field(self.cpa_auto_add_check, 7, 1, sticky=tk.W)
 
-        add_label(6, 0, "CPA auth 目录:")
+        add_label(8, 0, "CPA auth 目录:")
         self.cpa_auth_dir_var = tk.StringVar(value=str(config.get("cpa_auth_dir", "")))
         self.cpa_auth_dir_entry = tk_entry(config_frame, textvariable=self.cpa_auth_dir_var, width=72)
-        add_field(self.cpa_auth_dir_entry, 6, 1, columnspan=3)
+        add_field(self.cpa_auth_dir_entry, 8, 1, columnspan=3)
 
-        add_label(7, 0, "CPA 远程地址:")
+        add_label(9, 0, "CPA 远程地址:")
         self.cpa_remote_url_var = tk.StringVar(value=str(config.get("cpa_remote_url", "")))
         self.cpa_remote_url_entry = tk_entry(config_frame, textvariable=self.cpa_remote_url_var, width=40)
-        add_field(self.cpa_remote_url_entry, 7, 1)
+        add_field(self.cpa_remote_url_entry, 9, 1)
 
-        add_label(7, 2, "CPA 管理密钥:")
+        add_label(9, 2, "CPA 管理密钥:")
         self.cpa_management_key_var = tk.StringVar(value=str(config.get("cpa_management_key", "")))
         self.cpa_management_key_entry = tk_entry(config_frame, textvariable=self.cpa_management_key_var, width=28)
-        add_field(self.cpa_management_key_entry, 7, 3)
+        add_field(self.cpa_management_key_entry, 9, 3)
 
         btn_frame = tk.Frame(main_frame, bg=UI_BG)
         btn_frame.grid(row=1, column=0, sticky=tk.EW, pady=(0, 6))
@@ -2749,10 +3124,12 @@ class GrokRegisterGUI:
         config["email_provider"] = self.email_provider_var.get().strip() or "duckmail"
         config["enable_nsfw"] = bool(self.nsfw_var.get())
         config["proxy"] = self.proxy_var.get().strip()
+        config["proxy_pool_file"] = self.proxy_pool_file_var.get().strip()
         config["duckmail_api_key"] = self.api_key_var.get().strip()
         config["cloudflare_api_base"] = self.cloudflare_api_base_var.get().strip()
         config["cloudflare_api_key"] = self.cloudflare_api_key_var.get().strip()
         config["cloudflare_auth_mode"] = self.cloudflare_auth_mode_var.get().strip() or "none"
+        config["cloudflare_backend"] = self.cloudflare_backend_var.get().strip() or "temp_email"
         config["cpa_auto_add"] = bool(self.cpa_auto_add_var.get())
         config["cpa_auth_dir"] = self.cpa_auth_dir_var.get().strip()
         config["cpa_remote_url"] = self.cpa_remote_url_var.get().strip()
@@ -2766,6 +3143,13 @@ class GrokRegisterGUI:
         save_config()
         if config["email_provider"] == "cloudflare" and not config["cloudflare_api_base"]:
             self.log("[!] Cloudflare 模式需要先填写 Cloudflare API Base")
+            return
+        if (
+            config["email_provider"] == "cloudflare"
+            and config.get("cloudflare_backend") == "freemail"
+            and not config["cloudflare_api_key"]
+        ):
+            self.log("[!] freemail 后端需要填写 Admin Token（Cloudflare API Key）")
             return
         try:
             count = int(self.count_var.get())
@@ -2798,14 +3182,56 @@ class GrokRegisterGUI:
 
     def run_registration(self, count):
         try:
-            start_browser(log_callback=self.log)
-            self.log("[*] 浏览器已启动")
+            # 加载代理池：一代理一账号；先探测连通，不通则跳过
+            proxy_pool = []
+            pool_file = str(config.get("proxy_pool_file", "") or "").strip()
+            if pool_file:
+                try:
+                    proxy_pool = load_proxy_pool(pool_file)
+                except Exception as pool_exc:
+                    self.log(f"[!] 加载代理池失败: {pool_exc}")
+                    return
+                if not proxy_pool:
+                    self.log(f"[!] 代理池文件为空: {pool_file}")
+                    return
+                self.log(
+                    f"[*] 已加载代理池 {len(proxy_pool)} 个；先测连通再注册，不可用自动跳过"
+                )
+
+            proxy_cursor = 0
+            need_proxy = True
             i = 0
             retry_count_for_slot = 0
             max_slot_retry = 3
             while i < count:
                 if self.should_stop():
                     break
+                # 新账号槽位：从游标起找可用代理；同槽位重试则复用
+                if need_proxy:
+                    ok, proxy_cursor = acquire_proxy_for_slot(
+                        proxy_pool,
+                        cursor=proxy_cursor,
+                        log_callback=self.log,
+                        cancel_callback=self.should_stop,
+                        do_test=True,
+                    )
+                    if not ok:
+                        break
+                    need_proxy = False
+                    try:
+                        if browser is None:
+                            start_browser(log_callback=self.log)
+                            self.log("[*] 浏览器已启动")
+                        else:
+                            restart_browser(log_callback=self.log)
+                        time.sleep(1)
+                    except RegistrationCancelled:
+                        break
+                    except Exception as start_exc:
+                        self.log(f"[!] 启动浏览器失败，跳过当前代理: {start_exc}")
+                        need_proxy = True
+                        continue
+
                 self.log(f"--- 开始第 {i + 1}/{count} 个账号 ---")
                 try:
                     email = ""
@@ -2885,6 +3311,7 @@ class GrokRegisterGUI:
                     self.success_count += 1
                     retry_count_for_slot = 0
                     i += 1
+                    need_proxy = True
                     self.log(f"[+] 注册成功: {email}")
                     if (
                         self.success_count > 0
@@ -2904,6 +3331,7 @@ class GrokRegisterGUI:
                         self.log(
                             f"[!] 当前账号流程卡住，重试第 {retry_count_for_slot}/{max_slot_retry} 次: {exc}"
                         )
+                        need_proxy = False
                     else:
                         self.fail_count += 1
                         self.log(
@@ -2911,33 +3339,34 @@ class GrokRegisterGUI:
                         )
                         retry_count_for_slot = 0
                         i += 1
+                        need_proxy = True
                 except Exception as exc:
                     self.fail_count += 1
                     retry_count_for_slot = 0
                     i += 1
+                    need_proxy = True
                     self.log(f"[-] 注册失败: {exc}")
                 finally:
                     self.update_stats()
                     if self.should_stop():
                         break
-                    try:
-                        if browser is None:
-                            start_browser(log_callback=self.log)
-                        else:
+                    # 同槽位重试：清浏览器状态但复用当前代理；换号时由循环顶部换代理并重启
+                    if not need_proxy:
+                        try:
                             restart_browser(log_callback=self.log)
-                        # 停止后不再调用 cancel_callback，避免 finally 里二次抛出 RegistrationCancelled
-                        time.sleep(1)
-                    except RegistrationCancelled:
-                        break
-                    except Exception as restart_exc:
-                        if self.should_stop():
+                            time.sleep(1)
+                        except RegistrationCancelled:
                             break
-                        self.log(f"[Debug] 轮次清理/重启浏览器失败: {restart_exc}")
+                        except Exception as restart_exc:
+                            if self.should_stop():
+                                break
+                            self.log(f"[Debug] 轮次清理/重启浏览器失败: {restart_exc}")
         except RegistrationCancelled:
             self.log("[!] 注册被用户停止")
         except Exception as exc:
             self.log(f"[!] 任务异常: {exc}")
         finally:
+            set_current_proxy(None)
             try:
                 stop_browser()
             except BaseException:
@@ -2988,15 +3417,57 @@ def run_registration_cli(count):
         os.path.dirname(__file__),
         f"accounts_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
     )
+    # 加载代理池：一代理一账号；先探测连通，不通则跳过
+    proxy_pool = []
+    pool_file = str(config.get("proxy_pool_file", "") or "").strip()
+    if pool_file:
+        try:
+            proxy_pool = load_proxy_pool(pool_file)
+        except Exception as pool_exc:
+            cli_log(f"[!] 加载代理池失败: {pool_exc}")
+            return
+        if not proxy_pool:
+            cli_log(f"[!] 代理池文件为空: {pool_file}")
+            return
+        cli_log(
+            f"[*] 已加载代理池 {len(proxy_pool)} 个；先测连通再注册，不可用自动跳过"
+        )
+
     cli_log(f"[*] 终端模式启动，目标数量: {count}")
     cli_log(f"[*] 成功账号将实时保存到: {accounts_output_file}")
     try:
-        start_browser(log_callback=cli_log)
-        cli_log("[*] 浏览器已启动")
+        proxy_cursor = 0
+        need_proxy = True
         i = 0
         while i < count:
             if controller.should_stop():
                 break
+            # 新账号槽位：从游标起找可用代理；同槽位重试则复用
+            if need_proxy:
+                ok, proxy_cursor = acquire_proxy_for_slot(
+                    proxy_pool,
+                    cursor=proxy_cursor,
+                    log_callback=cli_log,
+                    cancel_callback=controller.should_stop,
+                    do_test=True,
+                )
+                if not ok:
+                    break
+                need_proxy = False
+                try:
+                    if browser is None:
+                        start_browser(log_callback=cli_log)
+                        cli_log("[*] 浏览器已启动")
+                    else:
+                        restart_browser(log_callback=cli_log)
+                    time.sleep(1)
+                except RegistrationCancelled:
+                    break
+                except Exception as start_exc:
+                    cli_log(f"[!] 启动浏览器失败，跳过当前代理: {start_exc}")
+                    need_proxy = True
+                    continue
+
             cli_log(f"--- 开始第 {i + 1}/{count} 个账号 ---")
             try:
                 email = ""
@@ -3075,6 +3546,7 @@ def run_registration_cli(count):
                 success_count += 1
                 retry_count_for_slot = 0
                 i += 1
+                need_proxy = True
                 cli_log(f"[+] 注册成功: {email}")
                 cli_log(f"[*] 当前统计: 成功 {success_count} | 失败 {fail_count}")
                 if success_count > 0 and success_count % MEMORY_CLEANUP_INTERVAL == 0 and i < count:
@@ -3091,36 +3563,37 @@ def run_registration_cli(count):
                     cli_log(
                         f"[!] 当前账号流程卡住，重试第 {retry_count_for_slot}/{max_slot_retry} 次: {exc}"
                     )
+                    need_proxy = False
                 else:
                     fail_count += 1
                     retry_count_for_slot = 0
                     i += 1
+                    need_proxy = True
                     cli_log(f"[-] 当前账号已达到最大重试次数，跳过: {exc}")
             except Exception as exc:
                 fail_count += 1
                 retry_count_for_slot = 0
                 i += 1
+                need_proxy = True
                 cli_log(f"[-] 注册失败: {exc}")
             finally:
                 if controller.should_stop():
                     break
-                try:
-                    if browser is None:
-                        start_browser(log_callback=cli_log)
-                    else:
+                # 同槽位重试：清浏览器状态但复用当前代理；换号时由循环顶部换代理并重启
+                if not need_proxy:
+                    try:
                         restart_browser(log_callback=cli_log)
-                    # 停止后不再调用 cancel_callback，避免 finally 里二次抛出 RegistrationCancelled
-                    time.sleep(1)
-                except KeyboardInterrupt:
-                    controller.stop()
-                    cli_log("[!] 收到 Ctrl+C，正在停止（再按一次强制中断）")
-                    break
-                except RegistrationCancelled:
-                    break
-                except Exception as restart_exc:
-                    if controller.should_stop():
+                        time.sleep(1)
+                    except KeyboardInterrupt:
+                        controller.stop()
+                        cli_log("[!] 收到 Ctrl+C，正在停止（再按一次强制中断）")
                         break
-                    cli_log(f"[Debug] 轮次清理/重启浏览器失败: {restart_exc}")
+                    except RegistrationCancelled:
+                        break
+                    except Exception as restart_exc:
+                        if controller.should_stop():
+                            break
+                        cli_log(f"[Debug] 轮次清理/重启浏览器失败: {restart_exc}")
     except KeyboardInterrupt:
         controller.stop()
         cli_log("[!] 收到 Ctrl+C，正在停止并清理")
@@ -3129,6 +3602,7 @@ def run_registration_cli(count):
     except Exception as exc:
         cli_log(f"[!] 任务异常: {exc}")
     finally:
+        set_current_proxy(None)
         try:
             signal.signal(signal.SIGINT, signal.SIG_IGN)
         except Exception:

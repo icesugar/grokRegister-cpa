@@ -290,6 +290,7 @@ def token_to_cpa_record(token: dict, email: str = "") -> dict:
     return {
         "type": "xai",
         "auth_kind": "oauth",
+        "referrer": "grok-build",
         "email": email or "",
         "sub": sub,
         "access_token": access,
