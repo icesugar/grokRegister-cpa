@@ -1,5 +1,9 @@
 {
   "duckmail_api_key": "",
+  "duckmail_api_base": "https://api.duckmail.sbs",
+  "cloudmail_url": "",
+  "cloudmail_admin_email": "",
+  "cloudmail_password": "",
   "cloudflare_api_base": "https://temp-mail.example.com",
   "cloudflare_api_key": "",
   "cloudflare_auth_mode": "none",
@@ -9,10 +13,14 @@
   "cloudflare_path_accounts": "/api/new_address",
   "cloudflare_path_token": "/api/token",
   "cloudflare_path_messages": "/api/mails",
+  "cloudflare_random_subdomain": false,
   "proxy": "",
   "proxy_pool_file": "",
   "enable_nsfw": true,
+  "close_browser_on_stop": false,
+  "log_level": "info",
   "register_count": 1,
+  "register_workers": 1,
   "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
   "cpa_auto_add": false,
   "cpa_auth_dir": "",
@@ -21,5 +29,8 @@
   "defaultDomains": "example.com",
   "email_provider": "cloudflare",
   "yyds_api_key": "",
-  "yyds_jwt": ""
+  "yyds_jwt": "",
+  "yyds_default_domain": "",
+  "mailnest_api_key": "",
+  "mailnest_project_code": "x-ai001"
 }

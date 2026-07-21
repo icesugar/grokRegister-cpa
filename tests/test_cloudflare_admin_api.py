@@ -22,7 +22,6 @@ class CloudflareAdminCreateTests(unittest.TestCase):
         self.original_config = app.config.copy()
         self.original_cf_domain_index = app._cf_domain_index
         app._cf_domain_index = 0
-        # 单测默认走 cloudflare_temp_email，避免被本地 config.json 的 freemail 污染
         app.config = app.DEFAULT_CONFIG.copy()
 
     def tearDown(self):
@@ -144,13 +143,36 @@ class CloudflareAdminCreateTests(unittest.TestCase):
                 captured["headers"] = dict(self.headers)
                 return DummyResponse({"email": "abc@edu.example.com"})
 
-        with patch.object(app, "_ensure_freemail_session", return_value=FakeSession()):
+        class FakeClient:
+            def __init__(self, api_base, token, get_proxies=None, timeout=20):
+                self.api_base = api_base
+                self.token = token
+                self.get_proxies = get_proxies
+                self.session = FakeSession()
+
+            def create_temp_address(self, preferred_domain="", length=10):
+                FakeClient._seen = {
+                    "get_proxies": self.get_proxies,
+                    "api_base": self.api_base,
+                    "token": self.token,
+                }
+                resp = self.session.get(
+                    f"{self.api_base}/api/generate",
+                    params={"length": length},
+                    timeout=15,
+                )
+                data = resp.json()
+                return data["email"], ""
+
+        with patch.object(app.freemail_provider, "FreemailClient", FakeClient):
             address, jwt = app.cloudflare_create_temp_address("https://freemail.example.com")
 
         self.assertEqual(address, "abc@edu.example.com")
         self.assertEqual(jwt, "")
         self.assertEqual(captured["url"], "https://freemail.example.com/api/generate")
         self.assertEqual(captured["headers"]["X-Admin-Token"], "fm-admin-token")
+        # 主程序必须注入 get_proxies，注册时 freemail 才能走代理池
+        self.assertIs(FakeClient._seen["get_proxies"], app.get_proxies)
 
     def test_debug_tool_can_create_address_through_admin_api(self):
         captured = {}

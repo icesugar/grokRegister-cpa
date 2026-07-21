@@ -22,6 +22,8 @@ auth_out.json
 auth_out/
 auth_merged.json
 *.auth.json
+xai-*.json
+auth_403/
 sso_list.txt
 token.json
 

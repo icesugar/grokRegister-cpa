@@ -5,6 +5,8 @@
 批量注册 Grok 账号，注册成功后自动把 OAuth 凭证写入 [CLIProxyAPI (CPA)](https://github.com/router-for-me/CLIProxyAPI)：支持本地 auth 目录热加载，也支持 Management API 远程上传。
 
 <p>
+  <a href="https://github.com/Git-creat7/grokRegister-cpa/stargazers"><img src="https://img.shields.io/github/stars/Git-creat7/grokRegister-cpa?style=flat&logo=github" alt="GitHub stars"></a>
+  <a href="https://github.com/Git-creat7/grokRegister-cpa/network/members"><img src="https://img.shields.io/github/forks/Git-creat7/grokRegister-cpa?style=flat&logo=github" alt="GitHub forks"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
   <img src="https://img.shields.io/badge/Python-3.9%2B-3776AB.svg" alt="Python 3.9+">
   <img src="https://img.shields.io/badge/Interface-GUI%20%2B%20CLI-success.svg" alt="GUI + CLI">
@@ -21,7 +23,7 @@
 
 ```text
 打开注册页 → 创建临时邮箱 → 收验证码 → 填资料 / 过人机验证
-   → 拿到 SSO cookie → device-flow 换 OAuth token
+   → 拿到 SSO cookie → 授权码流程换 OAuth token（带 referrer=grok-build）
    → 本地写入 cpa_auth_dir  和/或  POST 远程 CPA Management API
    → CPA 热加载，立即可用
 ```
@@ -31,7 +33,7 @@
 - 注册成功后自动入库 CPA（本地目录 / 远程 Management API，可同时开）
 - GUI + CLI 两种运行方式（CLI 仍会打开浏览器完成注册页）
 - Chromium/Chrome 自动处理 Turnstile
-- DuckMail / YYDS / Cloudflare 临时邮箱
+- DuckMail / YYDS / Cloudflare / MailNest（Outlook）/ CloudMail 临时邮箱
 - 注册后可选开启 NSFW
 - 页面卡住重试、验证码失败换邮箱、浏览器重启与内存清理
 - CLI：一次 `Ctrl+C` 安全停止，清理阶段不刷 traceback；再按一次强制中断
@@ -41,7 +43,7 @@
 - Python 3.9+
 - Google Chrome 或 Chromium
 - 可用的 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)
-- 能访问注册页、临时邮箱 API、`auth.x.ai` 的网络（device-flow 换 token 需要）
+- 能访问注册页、临时邮箱 API、`auth.x.ai` 的网络（授权码流程换 token 需要）
 
 ## 安装
 
@@ -54,28 +56,60 @@ cp config.example.json config.json
 
 编辑 `config.json` 后运行。
 
+### Windows 一键启动
+
+1. 按 [DEPLOYMENT.md](DEPLOYMENT.md) 用 Python 3.13 创建 `.venv` 并安装依赖
+2. 双击 `start-gui.cmd` 开图形界面，或 `start-cli.cmd` 开命令行（输入 `start` 开始）
+
 ## 配置
 
 | 配置项 | 说明 |
 | --- | --- |
-| `cpa_auto_add` | 是否开启 CPA 自动入库 |
+| `cpa_auto_add` | 是否注册后 SSO→CPA auth（关则只保存 SSO） |
+| `register_workers` | 并发浏览器数，默认 1，最大 8 |
+| `log_level` | `info`（默认，隐藏 `[Debug]`）/ `debug`（全量日志） |
+
+### 并发 / 连通性
+
+**并发 `register_workers`**
+- 每个 worker 独立 Chrome 用户目录，降低资料目录冲突
+- 实际并发不超过注册数量；worker 启动错开约 2 秒
+- 浏览器连续启动失败时日志会提示降低并发
+
+**连通性检查**
+- GUI「连通性检查」或开始注册前自动跑
+- 检查项：代理 TCP/出站、邮箱 API、CPA 本地目录/远程 Management API
+- 失败默认只警告，不强制拦截开跑
+
+**NSFW**
+- 自动开启失败**不阻塞**账号保存与 CPA 入库
+- 可网页手动开启；批量时可关掉「注册后开启 NSFW」提速
 | `cpa_auth_dir` | 本地 CPA auth 目录；写入 `xai-<email>.json`，可留空 |
 | `cpa_remote_url` | 远程 CPA 地址，如 `http://你的CPA地址:8317` |
 | `cpa_management_key` | 远程 CPA 管理密钥（`remote-management.secret-key` 明文） |
-| `email_provider` | `duckmail` / `yyds` / `cloudflare` |
+| `email_provider` | `duckmail` / `yyds` / `cloudflare` / `mailnest` / `cloudmail` |
+| `duckmail_api_base` | DuckMail/Mail.tm API 根地址，默认 `https://api.duckmail.sbs`；Mail.tm 填 `https://api.mail.tm` |
+| `duckmail_api_key` | DuckMail API Key（`dk_...`）；Mail.tm 公共接口可不填 |
+| `mailnest_api_key` | MailNest（迈巢 Outlook）API Key |
+| `mailnest_project_code` | MailNest 项目代码，默认 `x-ai001` |
+| `yyds_default_domain` | YYDS 固定收信域名；留空则自动选择已验证域名 |
+| `cloudmail_url` | CloudMail 站点根地址，不要附加 `/api` |
+| `cloudmail_admin_email` | CloudMail 管理员邮箱；也可用环境变量 `CLOUDMAIL_ADMIN_EMAIL` |
+| `cloudmail_password` | CloudMail 管理员密码；也可用环境变量 `CLOUDMAIL_PASSWORD` |
 | `register_count` | 目标注册数量 |
-| `proxy` | 单代理；未配置代理池时使用；device-flow 换 token 也走此代理 |
-| `proxy_pool_file` | 代理池 txt 路径（一行一个代理）；启用后一代理一账号，注册完自动切换 |
+| `proxy` | 单代理；未配置代理池时使用；授权码换 token 也走此代理 |
+| `proxy_pool_file` | 代理池 txt 路径（一行一个）；启用后一代理一账号，不可用自动跳过；有池时并发强制为 1 |
 | `enable_nsfw` | 注册后是否尝试开启 NSFW |
-| `cloudflare_api_base` | Cloudflare 临时邮箱 API 根地址 |
-| `cloudflare_api_key` | 默认匿名模式留空；admin / freemail 模式填密钥 |
-| `cloudflare_auth_mode` | `none` / `bearer` / `x-api-key` / `x-admin-auth` / `query-key`（仅 temp_email） |
+| `cloudflare_api_base` | Cloudflare / freemail API 根地址 |
+| `cloudflare_api_key` | temp_email：admin 模式填 `ADMIN_PASSWORD`；freemail：填 `X-Admin-Token` |
 | `cloudflare_backend` | `temp_email`（cloudflare_temp_email，默认）/ `freemail`（idinging/freemail） |
+| `cloudflare_auth_mode` | `none` / `bearer` / `x-api-key` / `x-admin-auth` / `query-key`（仅 temp_email） |
 | `cloudflare_custom_auth` | Worker 全局密码（`PASSWORDS`），注入 `x-custom-auth` |
 | `cloudflare_path_*` | domains / accounts / token / messages 路径（仅 temp_email） |
-| `defaultDomains` | Cloudflare 默认收信域名 |
+| `cloudflare_random_subdomain` | 是否创建 `user@随机子域.主域`（需 Worker `RANDOM_SUBDOMAIN_DOMAINS`；仅 temp_email） |
+| `defaultDomains` | Cloudflare / freemail / CloudMail 默认收信域名，多个用逗号分隔 |
 
-### Cloudflare 邮箱（默认 cloudflare_temp_email 匿名）
+### Cloudflare 邮箱（默认 temp_email 匿名）
 
 ```json
 {
@@ -116,11 +150,11 @@ cp config.example.json config.json
 ```
 
 `cloudflare_api_key` 填 freemail 的 Admin Token，请求头会注入 `X-Admin-Token`。  
-`cloudflare_auth_mode` / `cloudflare_path_*` 在 freemail 下会被忽略。
+`cloudflare_auth_mode` / `cloudflare_path_*` / 随机子域 在 freemail 下会被忽略。
 
 ### 代理池（一代理一账号）
 
-把代理写进 txt，一行一个；配置 `proxy_pool_file` 后，每个账号使用池中下一个代理（浏览器 + HTTP 请求 + CPA device-flow 共用）。
+把代理写进 txt，一行一个；配置 `proxy_pool_file` 后，每个账号使用池中下一个可用代理（浏览器 + HTTP + CPA 授权码流程共用）。
 
 ```text
 # proxies.txt
@@ -139,10 +173,11 @@ socks5://5.6.7.8:1080
 
 - 相对路径相对本脚本目录；也可用绝对路径
 - 忽略空行与 `#` 注释；无 `://` 时自动补 `http://`
-- **先探测连通**（访问 `accounts.x.ai` 等），不通则跳过该代理，换下一个
+- **先探测连通**（访问 `accounts.x.ai` 等），不通则跳过该代理
 - 可用代理耗尽或达到 `register_count` 时结束
-- 未配置 `proxy_pool_file` 时仍走原来的单代理 `proxy`（若配置了也会先探测）
-- 同一账号重试（验证码失败等）会复用当前代理，不会跳过
+- 未配置 `proxy_pool_file` 时仍走单代理 `proxy`（若配置了也会先探测）
+- 同一账号重试（验证码失败 / 流程卡住）会复用当前代理
+- 配置了代理池时 `register_workers` 强制为 1
 
 可参考仓库内 `proxies.example.txt`。
 
@@ -163,11 +198,55 @@ Worker 若配置了全局 `PASSWORDS`，再加：
 { "cloudflare_custom_auth": "你的全局访问密码" }
 ```
 
+### MailNest（Outlook 临时邮箱）
+
+[迈巢 MailNest](https://mailnest.top/) 采用项目制。配置 API Key 与项目代码（默认 `x-ai001`）：
+
+```json
+{
+  "email_provider": "mailnest",
+  "mailnest_api_key": "你的 API Key",
+  "mailnest_project_code": "x-ai001"
+}
+```
+
+- API Key：https://mailnest.top/account  
+- 项目代码：https://mailnest.top/buy-email（默认可直接用 `x-ai001`）
+
+### YYDS 邮箱固定域名
+
+默认自动选择已验证域名。若要固定收信域名：
+
+```json
+{
+  "email_provider": "yyds",
+  "yyds_default_domain": "你的收信域名.com"
+}
+```
+
+GUI「YYDS 收信域名」可填；留空则自动选择。
+
+### CloudMail 邮箱
+
+支持自建 [maillab/cloud-mail](https://github.com/maillab/cloud-mail)。程序用管理员接口创建随机地址，公开接口收信，结束后删除地址：
+
+```json
+{
+  "email_provider": "cloudmail",
+  "cloudmail_url": "https://mail.example.com",
+  "cloudmail_admin_email": "admin@example.com",
+  "cloudmail_password": "你的管理员密码",
+  "defaultDomains": "example.com"
+}
+```
+
+`cloudmail_url` 填站点根地址，不要附加 `/api`。也可用环境变量 `CLOUDMAIL_URL` / `CLOUDMAIL_ADMIN_EMAIL` / `CLOUDMAIL_PASSWORD`（优先于 config）。
+
 ## CPA 自动入库
 
 SSO 不是 CPA 凭据。程序会：
 
-1. 用 SSO 走 device-flow 向 `auth.x.ai` 换 `access_token` / `refresh_token`
+1. 用 SSO 走授权码流程（`referrer=grok-build`）向 `auth.x.ai` 换 `access_token` / `refresh_token`
 2. 组装 `type=xai` 扁平 auth（`cli-chat-proxy.grok.com`）
 3. 本地：`cpa_auth_dir` → `xai-<email>.json`（CPA 热加载）
 4. 远程：`POST {cpa_remote_url}/v0/management/auth-files?name=...`（需管理密钥）
@@ -202,6 +281,29 @@ SSO 不是 CPA 凭据。程序会：
 
 已有 SSO 时可脱离注册流程：
 
+#### GUI 补转
+
+注册任务停止时，点击主界面的 **补转缺失 SSO**。程序会在仓库目录扫描全部 `accounts_*.txt` 和 `sso_pending.txt`，按邮箱去重，再与远程 CPA 的已有邮箱比较，只转换远程缺失的账号。转换在后台线程运行，不会卡住界面；点击“停止”会在当前账号完成后停止补转。
+
+#### Python 自动扫描
+
+在仓库目录直接运行，无需指定 TXT：
+
+```bash
+python sso_to_auth_json.py
+```
+
+程序会自动读取当前目录的 `config.json`，扫描 `accounts_*.txt` 与 `sso_pending.txt`。也可指定其他目录和配置：
+
+```bash
+python sso_to_auth_json.py --scan-dir /path/to/register-output \
+  --config /path/to/register-output/config.json
+```
+
+只扫描上述账号文件，不会读取 `requirements.txt`、`mail_credentials.txt` 或其他无关 TXT。
+
+#### 显式指定文件
+
 ```bash
 # 写本地目录
 python sso_to_auth_json.py --sso sso_list.txt --cpa-auth-dir /path/to/auths
@@ -217,7 +319,20 @@ python sso_to_auth_json.py --sso-cookie 'eyJ...' \
   --proxy http://127.0.0.1:7890
 ```
 
-`sso_list.txt`：一行一个 SSO，或 `邮箱----密码----sso`。
+`sso_list.txt`：一行一个 SSO、`邮箱----sso`，或 `邮箱----密码----sso`。
+
+配置了远程 CPA 时，批量转换以远程 Management API 返回的邮箱为唯一判重来源：本地 TXT 有、远程 CPA 没有的账号才会转换。没有配置远程 CPA 时，才回退到本地有效 auth JSON 判重。TXT 内重复邮箱也会先去重。
+
+### 为什么必须用授权码流程
+
+这是本项目区别于普通 SSO→token 脚本的关键，踩过坑后固化下来：
+
+- **SSO 不能直接喂给 CPA。** CPA 走 OAuth，需要 `access_token` / `refresh_token`，SSO cookie 只是换 token 的入场券。
+- **必须带 `referrer=grok-build`。** xAI 后端要求 access_token 携带 `referrer=grok-build` claim，否则 grok build 通道（`cli-chat-proxy.grok.com`）拒绝，调用 chat 时报 `permission-denied / Access to the chat endpoint is denied`。早期用 device flow 换的 token **不带**这个 claim，会全部失效。
+- **解法：授权码流程（Authorization Code + PKCE）。** 在 `/oauth2/authorize` 和 consent 提交两处注入 `referrer=grok-build`，换出的 token 才带此 claim。程序换完会自动校验，日志显示 `access_token 已带 referrer=grok-build`。
+- **base_url 必须是 `cli-chat-proxy.grok.com/v1`。** 写入的 auth 记录 `base_url` 指向 grok build 免费通道；若为空，CPA 会回退到计费通道 `api.x.ai/v1`，同样触发 `permission-denied`。
+
+如果 CPA 里已有旧的失效号（`base_url=api.x.ai/v1` 或 `referrer=None`），用本节的独立转换脚本以相同邮箱重新生成一遍覆盖即可（文件名按 `xai-<email>.json` 命名，会原地覆盖）。
 
 ## 运行
 
@@ -236,7 +351,7 @@ python grok_register_ttk.py cli
 python grok_register_ttk.py
 ```
 
-可在界面里改 CPA 开关、auth 目录、远程地址与管理密钥。
+可在界面里改：邮箱服务商、代理、Cloudflare（API Base / 鉴权 / 收信域名 / 全局密码）、CPA 开关、auth 目录、远程地址与管理密钥。点击「开始注册」时会写回 `config.json`。
 
 ## 输出文件
 
@@ -268,6 +383,16 @@ curl -H "Authorization: Bearer <管理密钥>" \
   http://你的CPA地址:8317/v0/management/auth-files
 ```
 
+`cpa_remote_url` 填 CPA 实例根地址，不要附带 OpenAI 兼容接口的 `/v1`。程序会自动追加 `/v0/management/auth-files`。
+
+**创建 Cloudflare 邮箱时 curl 超时**
+
+如果当前网络需要代理访问 `workers.dev`，请在 GUI 的“代理”字段或 `config.json` 的 `proxy` 中显式填写代理地址。不要只依赖终端的 `HTTP_PROXY` / `HTTPS_PROXY`，从桌面启动 GUI 时可能不会继承这些环境变量。
+
+**开启 NSFW 时返回 403**
+
+设置出生日期可能被 `grok.com` 的 Cloudflare 防护拦截。该步骤失败不会影响账号保存和 CPA 入库；不需要敏感内容时可关闭“注册后开启 NSFW”。
+
 **CLI 为什么还开浏览器**  
 CLI 只是不启动 Tk；注册页、Turnstile、SSO 仍依赖真实浏览器。
 
@@ -277,18 +402,47 @@ CLI 只是不启动 Tk；注册页、Turnstile、SSO 仍依赖真实浏览器。
 **国内服务器调模型超时**  
 入库成功只说明凭证到了 CPA；调用上游 `cli-chat-proxy.grok.com` 还需服务器出网可达（或配置 CPA `proxy-url`）。
 
+**CPA 返回 `503 auth_unavailable: no auth available`**  
+不是网络超时，而是 CPA 当前没有可用的 xAI auth。检查：auth 是否写入并被热加载、token 是否带 `referrer=grok-build`、账号是否 403 权限拒绝或 429 免费额度耗尽。free 号走 `cli-chat-proxy` 的 build 通道，额度与权限由上游控制，可能抖动。
+
+**chat 报 `permission-denied` / Access to the chat endpoint is denied**  
+token 缺 `referrer=grok-build`，或 `base_url` 误指向 `api.x.ai`。用本仓库授权码流程重转覆盖对应 `xai-<email>.json`。
+
 ## 目录结构
 
 ```text
 .
 ├── grok_register_ttk.py      # 主程序（GUI / CLI + CPA 入库）
+├── browser_session.py        # 浏览器启停 / cf_clearance
+├── register_flow.py          # 注册页填表 / 验证码 / SSO
+├── connectivity.py           # 启动前连通性检查
+├── email_providers/
+│   ├── common.py             # 验证码提取等共用工具
+│   ├── duckmail.py           # DuckMail / Mail.tm
+│   ├── cloudflare.py         # Cloudflare 临时邮箱
+│   ├── yyds.py               # YYDS
+│   ├── mailnest.py           # MailNest Outlook
+│   └── cloudmail.py          # CloudMail
 ├── sso_to_auth_json.py       # SSO → CPA 转换（可独立运行）
 ├── cf_mail_debug.py          # Cloudflare 邮箱调试
 ├── config.example.json
 ├── requirements.txt
+├── start-gui.cmd             # Windows 启动 GUI
+├── start-cli.cmd             # Windows 启动 CLI
+├── DEPLOYMENT.md             # 本机 / Windows 部署
 ├── tests/
 └── assets/banner.png
 ```
+
+## Star History
+
+<a href="https://www.star-history.com/?type=date&repos=Git-creat7%2FgrokRegister-cpa">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=Git-creat7/grokRegister-cpa&type=date&theme=dark&legend=top-left&sealed_token=nLCws8QCmosQswlx1hTjASUcz8r72ZEKXOP1C8WmTFqosF65NL66q77qlMIbBZ6Kqic0cOqA5VisinVcERXNFlwMZqx0ET8872ALY3-k8rvCyvNqa-RxzMLV_oOrrAV54D0E6Pfv4WWTmaA6WYQBr2U5dizobLbasNLXpKTnZZJI7-uRL0zomGISzIGq" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=Git-creat7/grokRegister-cpa&type=date&legend=top-left&sealed_token=nLCws8QCmosQswlx1hTjASUcz8r72ZEKXOP1C8WmTFqosF65NL66q77qlMIbBZ6Kqic0cOqA5VisinVcERXNFlwMZqx0ET8872ALY3-k8rvCyvNqa-RxzMLV_oOrrAV54D0E6Pfv4WWTmaA6WYQBr2U5dizobLbasNLXpKTnZZJI7-uRL0zomGISzIGq" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=Git-creat7/grokRegister-cpa&type=date&legend=top-left&sealed_token=nLCws8QCmosQswlx1hTjASUcz8r72ZEKXOP1C8WmTFqosF65NL66q77qlMIbBZ6Kqic0cOqA5VisinVcERXNFlwMZqx0ET8872ALY3-k8rvCyvNqa-RxzMLV_oOrrAV54D0E6Pfv4WWTmaA6WYQBr2U5dizobLbasNLXpKTnZZJI7-uRL0zomGISzIGq" />
+ </picture>
+</a>
 
 ## License
 
