@@ -665,7 +665,19 @@ const hasEmail = inputs.some((n) => {
 });
 
 // 资料页：有密码框，或 名+姓，或 名/姓 + 生日；且不再有 OTP
-const hasProfile = (hasPassword || (hasGiven && hasFamily) || ((hasGiven || hasFamily) && hasBirth)) && !hasOtp;
+const hasProfile = (hasPassword || (hasGiven && hasFamily) || ((hasGiven || hasFamily) && hasBirth));
+
+const inputDetails = inputs.map((n) => {
+  return {
+    name: n.name || '',
+    id: n.id || '',
+    type: n.type || '',
+    autocomplete: n.autocomplete || '',
+    placeholder: n.placeholder || '',
+    ariaLabel: n.getAttribute('aria-label') || '',
+    dataTestId: n.getAttribute('data-testid') || '',
+  };
+}).slice(0, 20);
 
 return {
   url: location.href || '',
@@ -677,6 +689,7 @@ return {
   hasEmail: !!hasEmail,
   buttons,
   inputCount: inputs.length,
+  inputDetails,
 };
             """
         )
@@ -705,6 +718,19 @@ return false;
                 extra = f" ({reason})" if reason else ""
                 log_callback(f"[*] 验证码已通过，进入资料页{extra}: url={snap.get('url')}")
             return True
+        # 调试：打印快照信息，帮助排查
+        if log_callback and isinstance(snap, dict):
+            input_details = snap.get('inputDetails', [])
+            input_summary = "; ".join([
+                f"{d.get('name', '') or d.get('id', '') or d.get('dataTestId', '') or 'input'}"
+                f"[{d.get('type', '')}]" for d in input_details[:5]
+            ]) if input_details else "无"
+            log_callback(
+                f"[Debug] _already_on_profile({reason}): hasProfile={snap.get('hasProfile')} "
+                f"hasOtp={snap.get('hasOtp')} hasPassword={snap.get('hasPassword')} "
+                f"hasGiven={snap.get('hasGiven')} hasFamily={snap.get('hasFamily')} "
+                f"url={snap.get('url')} 输入框: {input_summary}"
+            )
         return False
 
     code = _deps['get_oai_code'](
@@ -821,11 +847,14 @@ return 'not-ready';
             log_callback(f"[*] 验证码已写入输入框: {code} ({filled})")
 
         # 填完 OTP 后先等一下：部分流程自动提交，无需再点按钮
-        for _ in range(6):
+        # 立即检测是否已跳转到资料页
+        if _already_on_profile("填完后立即检测"):
+            return code
+        for i in range(6):
             raise_if_cancelled(cancel_callback)
+            sleep_with_cancel(0.4, cancel_callback)
             if _already_on_profile("自动跳转"):
                 return code
-            sleep_with_cancel(0.4, cancel_callback)
 
         clicked = page.run_js(
             r"""
@@ -876,22 +905,27 @@ return 'clicked:' + ((btn.innerText || btn.textContent || '').replace(/\s+/g, ' 
             or clicked == "no-button"
         ):
             advanced = False
-            for i in range(16):
-                raise_if_cancelled(cancel_callback)
-                snap = _page_stage_snapshot()
-                if isinstance(snap, dict) and snap.get("hasProfile"):
-                    advanced = True
-                    break
-                if isinstance(snap, dict) and snap.get("hasOtp") is False and snap.get("hasPassword"):
-                    advanced = True
-                    break
-                if i in (0, 4, 8, 12) and log_callback and isinstance(snap, dict):
-                    log_callback(
-                        f"[Debug] 等待离开验证码页: url={snap.get('url')} "
-                        f"hasOtp={snap.get('hasOtp')} hasProfile={snap.get('hasProfile')} "
-                        f"hasPassword={snap.get('hasPassword')} buttons={snap.get('buttons')}"
-                    )
-                sleep_with_cancel(0.5, cancel_callback)
+            # 立即检测
+            snap = _page_stage_snapshot()
+            if isinstance(snap, dict) and snap.get("hasProfile"):
+                advanced = True
+            if not advanced:
+                for i in range(16):
+                    raise_if_cancelled(cancel_callback)
+                    sleep_with_cancel(0.5, cancel_callback)
+                    snap = _page_stage_snapshot()
+                    if isinstance(snap, dict) and snap.get("hasProfile"):
+                        advanced = True
+                        break
+                    if isinstance(snap, dict) and snap.get("hasOtp") is False and snap.get("hasPassword"):
+                        advanced = True
+                        break
+                    if i in (0, 4, 8, 12) and log_callback and isinstance(snap, dict):
+                        log_callback(
+                            f"[Debug] 等待离开验证码页: url={snap.get('url')} "
+                            f"hasOtp={snap.get('hasOtp')} hasProfile={snap.get('hasProfile')} "
+                            f"hasPassword={snap.get('hasPassword')} buttons={snap.get('buttons')}"
+                        )
             if advanced:
                 if log_callback:
                     log_callback(f"[*] 验证码已通过，进入资料页: {code}")
@@ -1224,7 +1258,22 @@ const buttons = Array.from(document.querySelectorAll('button[type="submit"], but
 });
 const submitBtn = buttons.find((node) => {
     const t = buttonText(node).replace(/\s+/g, '').toLowerCase();
-    return t.includes('完成注册') || t.includes('创建账户') || t.includes('signup') || t.includes('createaccount');
+    return (
+        t.includes('完成注册') ||
+        t.includes('创建账户') ||
+        t.includes('创建账号') ||
+        t.includes('注册') ||
+        t.includes('继续') ||
+        t.includes('下一步') ||
+        t.includes('signup') ||
+        t.includes('createaccount') ||
+        t.includes('continue') ||
+        t.includes('next') ||
+        t.includes('submit')
+    );
+}) || buttons.find((node) => {
+    const t = buttonText(node).replace(/\s+/g, '').toLowerCase();
+    return t.length > 0 && !t.includes('重新发送') && !t.includes('resend') && !t.includes('返回') && !t.includes('back');
 });
 if (!submitBtn) {
     const visibleTexts = buttons.map(buttonText).filter(Boolean).slice(0, 8).join(' | ');
@@ -1232,7 +1281,7 @@ if (!submitBtn) {
 }
 submitBtn.focus();
 submitBtn.click();
-return 'submitted';
+return 'submitted:' + buttonText(submitBtn).slice(0, 40);
             """
         )
 
@@ -1250,7 +1299,7 @@ return 'submitted';
                     token = getTurnstileToken(log_callback=log_callback, cancel_callback=cancel_callback)
                     if token:
                         synced = page.run_js(
-                            """
+                            r"""
 const token = String(arguments[0] || '').trim();
 const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
 if (!cfInput || !token) return false;
@@ -1272,15 +1321,23 @@ return String(cfInput.value || '').trim().length;
             sleep_with_cancel(0.8, cancel_callback)
             continue
 
-        if submit_state == "submitted":
+        if isinstance(submit_state, str) and (
+            submit_state == "submitted" or submit_state.startswith("submitted:")
+        ):
             if log_callback:
-                log_callback(f"[*] 已填写注册资料并提交: {given_name} {family_name}")
+                log_callback(f"[*] 已填写注册资料并提交: {given_name} {family_name} ({submit_state})")
             return {"given_name": given_name, "family_name": family_name, "password": password}
         wait_cf_since = None
         if isinstance(submit_state, str) and submit_state.startswith("no-submit-button") and log_callback:
             visible_buttons = submit_state.split(":", 1)[1] if ":" in submit_state else ""
             suffix = f" 可见按钮: {visible_buttons}" if visible_buttons else ""
             log_callback(f"[Debug] 未找到提交按钮，继续等待页面稳定...{suffix}")
+        elif log_callback and submit_state:
+            # 避免未知状态静默
+            now = time.time()
+            if now - last_diag_at >= 5:
+                last_diag_at = now
+                log_callback(f"[Debug] 资料提交状态: {submit_state}")
 
         sleep_with_cancel(0.5, cancel_callback)
 
